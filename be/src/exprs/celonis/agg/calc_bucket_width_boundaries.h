@@ -12,14 +12,15 @@
 
 namespace starrocks {
 
-template <LogicalType LT>
-struct CelonisCalcBucketBoundariesState {
+template<LogicalType LT>
+struct CelonisCalcBucketWidthBoundariesState {
 public:
     using CppType = RunTimeCppType<LT>;
-    using CountType = RunTimeCppType<TYPE_BIGINT>;
+    using WidthType = RunTimeCppType<TYPE_BIGINT>;
 
-    CelonisCalcBucketBoundariesState() : percentile(new PercentileValue()) {}
-    ~CelonisCalcBucketBoundariesState() = default;
+    CelonisCalcBucketWidthBoundariesState() : percentile(new PercentileValue()) {}
+
+    ~CelonisCalcBucketWidthBoundariesState() = default;
 
     void update(CppType value) {
         if constexpr (LT == TYPE_DATETIME) {
@@ -34,9 +35,9 @@ public:
     }
 
     void deserialize_and_merge(const uint8_t* src) {
-        CountType src_count;
-        memcpy(&src_count, src, sizeof(CountType));
-        src += sizeof(CountType);
+        WidthType src_width;
+        memcpy(&src_width, src, sizeof(WidthType));
+        src += sizeof(WidthType);
         CppType src_true_min;
         memcpy(&src_true_min, src, sizeof(CppType));
         src += sizeof(CppType);
@@ -44,9 +45,9 @@ public:
         memcpy(&src_true_max, src, sizeof(CppType));
         src += sizeof(CppType);
         PercentileValue src_percentile;
-        src_percentile.deserialize((const char *)src);
+        src_percentile.deserialize((const char*) src);
 
-        count = src_count;
+        width = src_width;
         true_min = std::min<CppType>(true_min, src_true_min);
         true_max = std::max<CppType>(true_max, src_true_max);
         percentile->merge(&src_percentile);
@@ -55,16 +56,16 @@ public:
 
     size_t serialized_size() const {
         size_t result = 0;
-        result += sizeof(CountType); // count
-        result += sizeof(CppType); // true_min
-        result += sizeof(CppType); // true_max
+        result += sizeof(WidthType); // width
+        result += sizeof(CppType);   // true_min
+        result += sizeof(CppType);   // true_max
         result += percentile->serialize_size();
         return result;
     }
 
     void serialize(uint8_t* dst) const {
-        memcpy(dst, &count, sizeof(CountType));
-        dst += sizeof(CountType);
+        memcpy(dst, &width, sizeof(WidthType));
+        dst += sizeof(WidthType);
         memcpy(dst, &true_min, sizeof(CppType));
         dst += sizeof(CppType);
         memcpy(dst, &true_max, sizeof(CppType));
@@ -72,7 +73,7 @@ public:
         percentile->serialize(dst);
     }
 
-    CountType count = 10;
+    WidthType width = 1;
     CppType true_min = RunTimeTypeLimits<LT>::max_value();
     CppType true_max = RunTimeTypeLimits<LT>::min_value();
     std::unique_ptr<PercentileValue> percentile;
@@ -80,24 +81,24 @@ public:
 };
 
 /**
- * @param: [col, count]
- * @paramType: [BIGINT | DOUBLE | DATETIME, BIGINT]
- *   count: Optional. Default is 10.
+ * @param: [col, width]
+ * @paramType: [BIGINT | DOUBLE | DATETIME, CONST BIGINT]
+ *   width: bucket width.
  * @return: ARRAY of col type
  *
  * Outputs a boundary array to be used as an input of celonis_histogram_boundaries() to implement PQL HISTOGRAM with
- * mode BUCKET_COUNT. https://celonis-confluence.atlassian.net/wiki/spaces/PQLdevelopment/pages/11245736/HISTOGRAM
+ * mode BUCKET_WIDTH. https://celonis-confluence.atlassian.net/wiki/spaces/PQLdevelopment/pages/11245736/HISTOGRAM
  *
  * Note: PercentileValue uses float so it may lose some precision especially with DATETIME with narrow ranges.
  */
-template <LogicalType LT>
-class CelonisCalcBucketBoundariesAggregateFunction final
-        : public AggregateFunctionBatchHelper<CelonisCalcBucketBoundariesState<LT>,
-                                              CelonisCalcBucketBoundariesAggregateFunction<LT>> {
+template<LogicalType LT>
+class CelonisCalcBucketWidthBoundariesAggregateFunction final
+        : public AggregateFunctionBatchHelper<CelonisCalcBucketWidthBoundariesState<LT>,
+                CelonisCalcBucketWidthBoundariesAggregateFunction<LT>> {
 public:
     using CppType = RunTimeCppType<LT>;
     using ColumnType = RunTimeColumnType<LT>;
-    using CountType = RunTimeCppType<TYPE_BIGINT>;
+    using WidthType = RunTimeCppType<TYPE_BIGINT>;
 
     void update(FunctionContext* ctx, const Column** columns, AggDataPtr state, size_t row_num) const override {
         CppType column_value;
@@ -113,9 +114,11 @@ public:
         if (this->data(state).is_null && ctx->get_num_args() == 2) {
             DCHECK(!columns[1]->only_null());
             DCHECK(!columns[1]->is_null(0));
-            CountType count = columns[1]->get(0).get<CountType>();
-            if (count > 0) {
-                this->data(state).count = count;
+            WidthType width = columns[1]->get(0).get<WidthType>();
+            if (width > 0) {
+                this->data(state).width = width;
+            } else if (width == 0) {
+                this->data(state).width = 1;
             }
         }
 
@@ -136,7 +139,7 @@ public:
             src = binary_column->get_slice(row_num);
         }
 
-        this->data(state).deserialize_and_merge((const uint8_t*)src.data);
+        this->data(state).deserialize_and_merge((const uint8_t*) src.data);
     }
 
     void serialize_to_column(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* to) const override {
@@ -183,12 +186,10 @@ public:
             }
         }
 
-        CountType count = 10;
-        if (ctx->get_num_args() == 2) {
-            DCHECK(src[1]->is_constant());
-            count = src[1]->get(0).get<CountType>();
-        }
+        DCHECK_EQ(2, ctx->get_num_args());
+        DCHECK(src[1]->is_constant());
 
+        WidthType width = src[1]->get(0).get<WidthType>();
         Bytes& bytes = result->get_bytes();
         bytes.reserve(chunk_size * 20);
         result->get_offset().resize(chunk_size + 1);
@@ -213,14 +214,14 @@ public:
                 }
                 percentile.add(to_histogram_value<LT>(value));
 
-                size_t new_size = old_size + sizeof(CountType) + sizeof(CppType) * 2 + percentile.serialize_size();
+                size_t new_size = old_size + sizeof(WidthType) + sizeof(CppType) * 2 + percentile.serialize_size();
                 bytes.resize(new_size);
                 uint8_t* dst = bytes.data() + old_size;
-                memcpy(dst, &count, sizeof(CountType)); // count
-                dst += sizeof(CountType);
-                memcpy(dst, &value, sizeof(CppType)); // true_min
+                memcpy(dst, &width, sizeof(WidthType)); // width
+                dst += sizeof(WidthType);
+                memcpy(dst, &value, sizeof(CppType));   // true_min
                 dst += sizeof(CppType);
-                memcpy(dst, &value, sizeof(CppType)); // true_max
+                memcpy(dst, &value, sizeof(CppType));   // true_max
                 dst += sizeof(CppType);
                 percentile.serialize(dst);
 
@@ -236,7 +237,6 @@ public:
         if (to->is_nullable()) {
             auto* nullable_column = down_cast<NullableColumn*>(to);
             if (state_impl.is_null) {
-                // TODO: Check if this case is handled well by celonis_histogram_boundaries().
                 nullable_column->append_default();
                 return;
             }
@@ -249,30 +249,19 @@ public:
         double min_value = state_impl.percentile->quantile(HISTOGRAM_MIN_TARGET_QUANTILE);
         double max_value = state_impl.percentile->quantile(HISTOGRAM_MAX_TARGET_QUANTILE);
 
-        generate_boundaries(min_value, max_value, state_impl.true_min, state_impl.true_max, state_impl.count,
+        generate_boundaries(min_value, max_value, state_impl.true_min, state_impl.true_max, state_impl.width,
                             down_cast<ArrayColumn*>(data_column));
     }
 
-    std::string get_name() const override { return "celonis_calc_bucket_count_boundaries"; }
+    std::string get_name() const override { return "celonis_calc_bucket_width_boundaries"; }
 
 private:
-    void generate_boundaries(double min_value, double max_value, CppType true_min, CppType true_max, CountType count,
+    void generate_boundaries(double min_value, double max_value, CppType true_min, CppType true_max, WidthType width,
                              ArrayColumn* to) const {
         double true_min_value = to_histogram_value<LT>(true_min);
         double true_max_value = to_histogram_value<LT>(true_max);
 
-        double width = static_cast<double>(max_value - min_value) / static_cast<double>(count);
-        if (width == 0) {
-            width = 1;
-        }
-        if constexpr (LT == TYPE_DOUBLE) {
-            if (width > 0.5) {
-                width = std::ceil(width);
-            }
-        } else {
-            width = std::ceil(width);
-        }
-        count = std::min(count, static_cast<CountType>(std::ceil((true_max_value - true_min_value + 1) / width)));
+        WidthType count = static_cast<WidthType>(std::ceil((true_max_value - true_min_value + 1) / width));
 
         if (min_value + (width * static_cast<double>(count)) > true_max_value && min_value > true_min_value) {
             min_value = min_value - std::min(min_value - true_min_value,
