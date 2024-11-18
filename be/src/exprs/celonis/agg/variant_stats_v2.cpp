@@ -1,6 +1,7 @@
-#include "variant_stats.h"
+#include "variant_stats_v2.h"
 
-#include <queue>
+#include <stack>
+#include <chrono>
 
 #include "column/column_helper.h"
 #include "exprs/celonis/agg/util.h"
@@ -13,7 +14,8 @@
 
 namespace starrocks {
 
-int VariantStatsFinalizer::compute_happy_variant(const std::vector<VRef>& sorted) const {
+
+size_t CelonisVariantStatsAggregateV2State::compute_happy_variant(const std::vector<size_t>& sorted) const {
     // Happy path
     // find top start activity
     // find top end activity which is not top start
@@ -41,14 +43,13 @@ int VariantStatsFinalizer::compute_happy_variant(const std::vector<VRef>& sorted
 
     // Note: if there is a single activity in the data we will get
     // start = 0, end = 0 and will return the top variant.
-
-    int happy = 0; // default happy is top freq variant.
-    for (int i = 0; i < sorted.size(); i++) {
-        const auto& v = sorted[i]->first.data;
-        if (v.empty()) {
+    size_t happy = 0; // default happy is top freq variant.
+    for (size_t i = 0; i < sorted.size(); i++) {
+        auto [lo, hi] = get_offsets(sorted[i]);
+        if (lo == hi) {
             continue;
         }
-        if (v[0] == top_start && v[v.size() - 1] == top_end) {
+        if (activities_[lo] == top_start && activities_[hi - 1] == top_end) {
             happy = i;
             break;
         }
@@ -57,28 +58,25 @@ int VariantStatsFinalizer::compute_happy_variant(const std::vector<VRef>& sorted
     return happy;
 }
 
-void VariantStatsFinalizer::compute_top_variants(std::vector<VList>& activity_top_variants, VRef& happy,
-                                                 std::optional<std::string> query_id) const {
-    if (variant_map_.empty() || activity_map_.empty()) {
+void CelonisVariantStatsAggregateV2State::compute_top_variants(std::vector<std::vector<size_t>>& activity_top_variants,
+                                                               size_t& happy) const {
+    if (no_activities() || no_variants()) {
         // No data.
         return;
     }
 
-    // 1. sort variants by count
-    std::vector<VRef> v_count(variant_map_.size());
-    int index = 0;
-    for (auto it = variant_map_.cbegin(); it != variant_map_.cend(); it++) {
-        v_count[index++] = it;
+    // 1. sort variants by count (from high to low)
+    std::vector<size_t> sorted_indexes;
+    sorted_indexes.reserve(counts_.size());
+    for (size_t i = 0; i < counts_.size(); ++i) {
+        sorted_indexes.push_back(i);
     }
-    LOG(INFO) << log_prefix(query_id) << ": started variants sorting\n";
-    std::sort(v_count.begin(), v_count.end(),
-              [](const VRef& lhs, const VRef& rhs) { return lhs->second > rhs->second; });
-    LOG(INFO) << log_prefix(query_id) << ": done variants sorting (variant_map_ size = " << variant_map_.size()
-              << ")\n";
+    std::sort(sorted_indexes.begin(), sorted_indexes.end(),
+              [&](size_t a, size_t b) { return counts_[a] > counts_[b]; });
 
     // 2. find a happy variant
-    int happy_v = compute_happy_variant(v_count);
-    happy = v_count[happy_v];
+    size_t happy_v = compute_happy_variant(sorted_indexes);
+    happy = sorted_indexes[happy_v];
 
     if (disable_top_variant_stats_) {
         return;
@@ -86,24 +84,23 @@ void VariantStatsFinalizer::compute_top_variants(std::vector<VList>& activity_to
 
     // 3. find top-10 variants for each activity
     // Make sure we get enough variants so that each activity has 10 entries
-
-    activity_top_variants.resize(activity_map_.size());
+    activity_top_variants.resize(activity_array_.size());
     for (int i = 0; i < activity_top_variants.size(); i++) {
         activity_top_variants[i].reserve(10);
     }
 
-    std::vector<int8_t> a_done(activity_map_.size(), 0);
+    std::vector<int8_t> a_done(activity_array_.size(), 0);
     int done_count = 0;
 
-    for (int i = 0; i < v_count.size(); i++) {
+    for (int i = 0; i < sorted_indexes.size(); i++) {
         // Check activities matched by this variant.
-        const auto& variant = v_count[i]->first;
-        std::vector<int8_t> a_seen(activity_map_.size(), 0);
-        for (int j = 0; j < variant.data.size(); j++) {
-            uint32_t idx = variant.data[j];
+        auto [lo, hi] = get_offsets(sorted_indexes[i]);
+        std::vector<int8_t> a_seen(activity_array_.size(), 0);
+        for (auto j = lo; j < hi; ++j) {
+            auto idx = activities_[j];
             if (a_done[idx] == 0 && a_seen[idx] == 0) {
                 a_seen[idx] = 1;
-                activity_top_variants[idx].push_back(v_count[i]);
+                activity_top_variants[idx].push_back(sorted_indexes[i]);
                 if (activity_top_variants[idx].size() >= 10) {
                     a_done[idx] = 1;
                     done_count++;
@@ -111,25 +108,27 @@ void VariantStatsFinalizer::compute_top_variants(std::vector<VList>& activity_to
             }
         }
         // Stop early if we have already collected 10 variants for every activity.
-        if (done_count == activity_map_.size()) {
+        if (done_count == activity_array_.size()) {
             break;
         }
     }
 }
 
 std::optional<std::string>
-VariantStatsFinalizer::json_string(const std::vector<VList>& activity_top_variants, const VRef& happy) const {
+CelonisVariantStatsAggregateV2State::json_string(const std::vector<std::vector<size_t>>& activity_top_variants,
+                                                 size_t happy) const {
     rapidjson::Document d;
     rapidjson::Document::AllocatorType& allocator = d.GetAllocator();
     d.SetObject();
 
     // Dictionary
     rapidjson::Value dict(rapidjson::kArrayType);
-    for (auto it = activity_map_.begin(); it != activity_map_.end(); it++) {
+    for (auto i = 0; i < activity_array_.size(); ++i) {
         rapidjson::Value obj(rapidjson::kObjectType);
-        obj.AddMember("id", it->second, allocator);
+        obj.AddMember("id", i, allocator);
         rapidjson::Value s(rapidjson::kObjectType);
-        obj.AddMember("name", rapidjson::Value().SetString(it->first.data, it->first.size, allocator), allocator);
+        std::string activity = activity_array_[i];
+        obj.AddMember("name", rapidjson::Value().SetString(activity.data(), activity.size(), allocator), allocator);
         dict.PushBack(obj, allocator);
     }
     d.AddMember("dict", dict, allocator);
@@ -139,8 +138,8 @@ VariantStatsFinalizer::json_string(const std::vector<VList>& activity_top_varian
     for (int i = 0; i < activity_stats_.size(); i++) {
         rapidjson::Value obj = activity_stats_[i].to_json(allocator);
         obj.AddMember("id", i, allocator);
-        auto it = edge_map_.find({i, i});
-        if (it != edge_map_.end()) {
+        auto it = edge_stats_.find({i, i});
+        if (it != edge_stats_.end()) {
             obj.AddMember("self_loop_count_case", it->second.count_case, allocator);
         }
         a_stats.PushBack(obj, allocator);
@@ -150,9 +149,12 @@ VariantStatsFinalizer::json_string(const std::vector<VList>& activity_top_varian
     // Edge stats
     rapidjson::Value e_stats(rapidjson::kArrayType);
     if (edge_count_ >= 0) {
-        d.AddMember("e_count", edge_map_.size(), allocator);
-        std::map<Slice, int32_t> ordered_activity_map(activity_map_.begin(), activity_map_.end());
-        std::vector<int32_t> activity_unorderd_to_ordered(activity_map_.size());
+        d.AddMember("e_count", edge_stats_.size(), allocator);
+        std::map<std::string, int32_t> ordered_activity_map;
+        for (auto i = 0; i < activity_array_.size(); ++i) {
+            ordered_activity_map.insert({activity_array_[i], i});
+        }
+        std::vector<int32_t> activity_unorderd_to_ordered(activity_array_.size());
         int index = 0;
         for (auto it = ordered_activity_map.begin(); it != ordered_activity_map.end(); ++it, ++index) {
             DCHECK_LT(it->second, activity_unorderd_to_ordered.size());
@@ -169,7 +171,7 @@ VariantStatsFinalizer::json_string(const std::vector<VList>& activity_top_varian
             }
         };
         std::priority_queue<EdgeOrderedID, std::vector<EdgeOrderedID>, CmpOnEdgeOrderedID> pq;
-        for (auto it = edge_map_.cbegin(); it != edge_map_.cend(); ++it) {
+        for (auto it = edge_stats_.cbegin(); it != edge_stats_.cend(); ++it) {
             pq.push({activity_unorderd_to_ordered[it->first.src], activity_unorderd_to_ordered[it->first.dst], it});
             if (pq.size() > edge_count_) {
                 pq.pop();
@@ -200,8 +202,14 @@ VariantStatsFinalizer::json_string(const std::vector<VList>& activity_top_varian
             rapidjson::Value a(rapidjson::kArrayType);
             for (int j = 0; j < activity_top_variants[i].size(); j++) {
                 rapidjson::Value var_obj(rapidjson::kObjectType);
-                rapidjson::Value act = activity_top_variants[i][j]->first.to_json(allocator);
-                size_t count = activity_top_variants[i][j]->second;
+                size_t count = counts_[activity_top_variants[i][j]];
+
+                rapidjson::Value act(rapidjson::kArrayType);
+                auto [lo, hi] = get_offsets(activity_top_variants[i][j]);
+                for (size_t idx = lo; idx < hi; idx++) {
+                    act.PushBack(activities_[idx], allocator);
+                }
+
                 var_obj.AddMember("variant", act, allocator);
                 var_obj.AddMember("count", count, allocator);
                 a.PushBack(var_obj, allocator);
@@ -213,9 +221,13 @@ VariantStatsFinalizer::json_string(const std::vector<VList>& activity_top_varian
     }
 
     // Happy path
-    size_t happy_count = happy->second;
+    size_t happy_count = counts_[happy];
     rapidjson::Value happy_obj(rapidjson::kObjectType);
-    rapidjson::Value happy_var = happy->first.to_json(allocator);
+    rapidjson::Value happy_var(rapidjson::kArrayType);
+    auto [lo, hi] = get_offsets(happy);
+    for (size_t i = lo; i < hi; i++) {
+        happy_var.PushBack(activities_[i], allocator);
+    }
     happy_obj.AddMember("variant", happy_var, allocator);
     happy_obj.AddMember("count", happy_count, allocator);
     d.AddMember("happy", happy_obj, allocator);
@@ -229,15 +241,15 @@ VariantStatsFinalizer::json_string(const std::vector<VList>& activity_top_varian
 }
 
 std::optional<std::string>
-VariantStatsFinalizer::base64_encoded_string(const std::vector<VList>& activity_top_variants, const VRef& happy,
-                                             std::optional<std::string> query_id) const {
+CelonisVariantStatsAggregateV2State::base64_encoded_string(
+        const std::vector<std::vector<size_t>>& activity_top_variants, size_t happy) const {
     celonis::accelerator::Statistics statistics_proto;
     // construct proto
     // Dictionary
-    for (auto it = activity_map_.begin(); it != activity_map_.end(); it++) {
+    for (auto i = 0; i < activity_array_.size(); ++i) {
         celonis::accelerator::DictionaryEntry entry;
-        entry.set_id(it->second);
-        entry.set_name(std::string(it->first.data, it->first.size));
+        entry.set_id(i);
+        entry.set_name(activity_array_[i]);
         *statistics_proto.add_dict() = entry;
     }
     // Activity stats
@@ -249,17 +261,20 @@ VariantStatsFinalizer::base64_encoded_string(const std::vector<VList>& activity_
         entry.set_count_case(as.count_case);
         entry.set_count_start(as.count_start);
         entry.set_count_end(as.count_end);
-        auto it = edge_map_.find({i, i});
-        if (it != edge_map_.end()) {
+        auto it = edge_stats_.find({i, i});
+        if (it != edge_stats_.end()) {
             entry.set_self_loop_count_case(it->second.count_case);
         }
         *statistics_proto.add_a_stats() = entry;
     }
     // Edge stats
     if (edge_count_ >= 0) {
-        statistics_proto.set_e_count(edge_map_.size());
-        std::map<Slice, int32_t> ordered_activity_map(activity_map_.begin(), activity_map_.end());
-        std::vector<int32_t> activity_unorderd_to_ordered(activity_map_.size());
+        statistics_proto.set_e_count(edge_stats_.size());
+        std::map<std::string, int32_t> ordered_activity_map;
+        for (auto i = 0; i < activity_array_.size(); ++i) {
+            ordered_activity_map.insert({activity_array_[i], i});
+        }
+        std::vector<int32_t> activity_unorderd_to_ordered(activity_array_.size());
         int index = 0;
         for (auto it = ordered_activity_map.begin(); it != ordered_activity_map.end(); ++it, ++index) {
             DCHECK_LT(it->second, activity_unorderd_to_ordered.size());
@@ -276,7 +291,7 @@ VariantStatsFinalizer::base64_encoded_string(const std::vector<VList>& activity_
             }
         };
         std::priority_queue<EdgeOrderedID, std::vector<EdgeOrderedID>, CmpOnEdgeOrderedID> pq;
-        for (auto it = edge_map_.cbegin(); it != edge_map_.cend(); ++it) {
+        for (auto it = edge_stats_.cbegin(); it != edge_stats_.cend(); ++it) {
             pq.push({activity_unorderd_to_ordered[it->first.src], activity_unorderd_to_ordered[it->first.dst], it});
             if (pq.size() > edge_count_) {
                 pq.pop();
@@ -300,132 +315,146 @@ VariantStatsFinalizer::base64_encoded_string(const std::vector<VList>& activity_
     }
     // Variants
     if (!disable_top_variant_stats_) {
-        uint32_t total_variants = 0;
         for (int i = 0; i < activity_top_variants.size(); i++) {
             celonis::accelerator::VariantEntry entry;
             entry.set_id(i);
             for (int j = 0; j < activity_top_variants[i].size(); j++) {
                 celonis::accelerator::VariantCountPair count_pair;
-                size_t count = activity_top_variants[i][j]->second;
+                size_t count = counts_[activity_top_variants[i][j]];
                 count_pair.set_count(count);
-                const auto& data = activity_top_variants[i][j]->first.data;
-                for (int k = 0; k < data.size(); ++k) {
-                    ++total_variants;
-                    count_pair.add_variant(data[k]);
+                auto [lo, hi] = get_offsets(activity_top_variants[i][j]);
+                for (auto idx = lo; idx < hi; ++idx) {
+                    count_pair.add_variant(activities_[idx]);
                 }
                 *entry.add_top() = count_pair;
             }
             *statistics_proto.add_top() = entry;
         }
-        LOG(INFO) << log_prefix(query_id) << ": total number of top variants = " << total_variants << "\n";
     }
     // Happy path
     celonis::accelerator::VariantCountPair count_pair;
-    size_t happy_count = happy->second;
+    size_t happy_count = counts_[happy];
     count_pair.set_count(happy_count);
-    const auto& data = happy->first.data;
-    for (int i = 0; i < data.size(); i++) {
-        count_pair.add_variant(data[i]);
+    auto [lo, hi] = get_offsets(happy);
+    for (auto i = lo; i < hi; ++i) {
+        count_pair.add_variant(activities_[i]);
     }
     *statistics_proto.mutable_happy() = count_pair;
 
     // set size limit to 100M.
     std::optional<std::string> encoded_string = to_base64_encoded_string(statistics_proto, (100LL << 20));
     if (!encoded_string.has_value()) {
-        LOG(ERROR) << "CELONIS_VARIANT_STATS: proto serialized size exceeds maximum supported length (100M).\n";
+        LOG(ERROR) << "CELONIS_VARIANT_STATS_V2: proto serialized size exceeds maximum supported length (100M).\n";
     }
     return encoded_string;
 }
 
 std::optional<std::string>
-VariantStatsFinalizer::to_string(const std::vector<VList>& activity_top_variants, const VRef& happy,
-                                 std::optional<std::string> query_id) const {
+CelonisVariantStatsAggregateV2State::to_string(const std::vector<std::vector<size_t>>& activity_top_variants,
+                                               size_t happy) const {
     if (enable_proto_encoding_) {
-        return base64_encoded_string(activity_top_variants, happy, query_id);
+        return base64_encoded_string(activity_top_variants, happy);
     } else {
         return json_string(activity_top_variants, happy);
     }
 }
 
-std::string VariantStatsFinalizer::log_prefix(std::optional<std::string> query_id) const {
+
+std::string CelonisVariantStateV2AggregationFunction::log_prefix(std::optional<std::string> query_id) const {
     if (query_id.has_value()) {
-        return "CELONIS_VARIANT_STATS (" + query_id.value() + ")";
+        return "CELONIS_VARIANT_STATS_V2 (" + query_id.value() + ")";
     }
-    return "CELONIS_VARIANT_STATS (" + uuid_string_ + ")";
+    return "CELONIS_VARIANT_STATS_V2";
 }
 
-std::optional<std::string> VariantStatsFinalizer::finalize(FunctionContext* ctx) {
+void CelonisVariantStateV2AggregationFunction::update(FunctionContext* ctx, const Column** columns, AggDataPtr state,
+                                                      size_t row_num) const {
+    this->data(state).update(ctx, columns, row_num);
+}
+
+void
+CelonisVariantStateV2AggregationFunction::merge(FunctionContext* ctx, const Column* column, AggDataPtr __restrict state,
+                                                size_t row_num) const {
+    // merge internal state with column[row_num]
+    // the column type is binary
+    if (column->is_null(row_num)) {
+        return;
+    }
+    const auto* input_column = down_cast<const BinaryColumn*>(ColumnHelper::get_data_column(column));
+    Slice slice = input_column->get_slice(row_num);
+    this->data(state).deserialize_and_merge((const uint8_t*) slice.data, slice.size);
+}
+
+void
+CelonisVariantStateV2AggregationFunction::serialize_to_column(FunctionContext* ctx, ConstAggDataPtr __restrict state,
+                                                              Column* to) const {
+    // append our serialized state to column "to"
+    auto* column = down_cast<BinaryColumn*>(ColumnHelper::get_data_column(to));
+    if (to->is_nullable()) {
+        down_cast<NullableColumn*>(to)->null_column_data().emplace_back(0);
+    }
+    size_t old_size = column->get_bytes().size();
+    size_t new_size = old_size + this->data(state).serialized_size();
+    column->get_bytes().resize(new_size);
+    this->data(state).serialize(column->get_bytes().data() + old_size);
+    column->get_offset().emplace_back(new_size);
+}
+
+void CelonisVariantStateV2AggregationFunction::convert_to_serialize_format(FunctionContext* ctx, const Columns& src,
+                                                                           size_t chunk_size,
+                                                                           ColumnPtr* dst) const {
+    // Used for streaming aggregation. Not implemented.
+    throw std::runtime_error("celonis_variant_stats_v2: convert_to_serialize_format not supported");
+}
+
+void
+CelonisVariantStateV2AggregationFunction::finalize_to_column(FunctionContext* ctx, ConstAggDataPtr __restrict state,
+                                                             Column* to) const {
+    auto& state_impl = this->data(state);
     std::optional<std::string> query_id = std::nullopt;
     if (ctx->state() != nullptr) {
         query_id = print_id(ctx->state()->query_id());
     }
-    LOG(INFO) << log_prefix(query_id) << ": merging_seconds = " << merging_microseconds_ / 1000000.0 << " seconds."
-              << std::endl;
-    LOG(INFO) << log_prefix(query_id) << ": merging_bytes = " << merging_bytes_ << " bytes." << std::endl;
-    LOG(INFO) << log_prefix(query_id) << ": number of states merged = " << merging_states_ << std::endl;
-    if (activity_map_.size() > std::numeric_limits<int16_t>::max()) {
+    LOG(INFO) << log_prefix(query_id) << ": merging_seconds = " << state_impl.merging_microseconds() / 1000000.0
+              << " seconds." << std::endl;
+    LOG(INFO) << log_prefix(query_id) << ": merging_bytes = " << state_impl.merging_bytes() << " bytes." << std::endl;
+    LOG(INFO) << log_prefix(query_id) << ": number of states merged = " << state_impl.merging_states() << std::endl;
+
+    if (state_impl.activity_array().size() > std::numeric_limits<int16_t>::max()) {
         ctx->set_error(std::string(
-                               "CELONIS_VARIANT_STATS: the size of activity_map is " + std::to_string(activity_map_.size()) +
+                               "CELONIS_VARIANT_STATS_V2: the number of unique activities is " +
+                               std::to_string(state_impl.activity_array().size()) +
                                " which is greater than the limit " +
                                std::to_string(std::numeric_limits<int16_t>::max()))
                                .c_str(),
                        false);
-        return std::nullopt;
+        return;
     }
-    if (variant_map_.empty() || activity_map_.empty()) {
-        return enable_proto_encoding_ ? "" : "{}";
+    std::string output = "";
+    if (state_impl.no_activities() || state_impl.no_variants()) {
+        output = state_impl.enable_proto_encoding() ? "" : "{}";
+        down_cast<BinaryColumn*>(to)->append(output);
+        return;
     }
-
-    std::vector<size_t> a_lastseen(activity_map_.size());
-    std::map<std::pair<int32_t, int32_t>, std::pair<int32_t, int32_t>> edge_stats;
-    LOG(INFO) << log_prefix(query_id) << ": started traversing variant_map_ (length = " << variant_map_.size() << ")\n";
-    for (const auto& [variant, count]: variant_map_) {
-        for (int i = 0; i < variant.data.size(); i++) {
-            auto activity_id = variant.data[i];
-            ActivityStats& a_stats = activity_stats_[activity_id];
-            a_stats.count += count;
-            if (a_lastseen[activity_id] != variant.hash) {
-                a_stats.count_case += count;
-                a_lastseen[activity_id] = variant.hash;
-            }
-            if (i == 0) {
-                a_stats.count_start += count;
-            }
-            if (i == variant.data.size() - 1) {
-                a_stats.count_end += count;
-            }
-            if (i > 0 && (edge_count_ >= 0 || variant.data[i - 1] == activity_id)) {
-                Edge e(variant.data[i - 1], activity_id);
-                auto& e_stats = edge_map_[e];
-                e_stats.count += count;
-                if (e_stats.last_variant != &variant) {
-                    e_stats.last_variant = &variant;
-                    e_stats.count_case += count;
-                }
-            }
-        }
-    }
-    LOG(INFO) << log_prefix(query_id) << ": done traversing variant_map_\n";
-    LOG(INFO) << log_prefix(query_id) << ": (done traversing variant_map) size of activity_stats_ = "
-              << activity_stats_.size() << "\n";
-    LOG(INFO) << log_prefix(query_id) << ": (done traversing variant_map) size of edge_map_ = " << edge_map_.size()
-              << "\n";
     LOG(INFO) << log_prefix(query_id) << ": started finding top\n";
-    std::vector<VList> activity_top_variants;
-    VRef happy;
-    compute_top_variants(activity_top_variants, happy, query_id);
+    std::vector<std::vector<size_t>> activity_top_variants;
+    size_t happy;
+    state_impl.compute_top_variants(activity_top_variants, happy);
     LOG(INFO) << log_prefix(query_id) << ": done finding top (activity_top_variants size = "
               << activity_top_variants.size()
               << ")\n";
     LOG(INFO) << log_prefix(query_id) << ": started to_string\n";
-    auto rv = to_string(activity_top_variants, happy, query_id);
+    auto rv = state_impl.to_string(activity_top_variants, happy);
     if (rv.has_value()) {
         LOG(INFO) << log_prefix(query_id) << ": done to_string (length = " << rv->size() << ")\n";
+        output = rv.value();
     } else {
-        ctx->set_error(std::string("CELONIS_VARIANT_STATS: output string size exceeds the limit (100M)").c_str(),
+        ctx->set_error(std::string("CELONIS_VARIANT_STATS_V2: output string size exceeds the limit (100M)").c_str(),
                        false);
     }
-    return rv;
+    down_cast<BinaryColumn*>(to)->append(output);
 }
+
+std::string CelonisVariantStateV2AggregationFunction::get_name() const { return "celonis_variant_stats_v2"; }
 
 } // namespace starrocks
