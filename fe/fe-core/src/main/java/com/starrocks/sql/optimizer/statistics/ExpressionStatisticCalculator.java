@@ -595,6 +595,7 @@ public class ExpressionStatisticCalculator {
             double minValue = columnStatistic.getMinValue();
             double maxValue = columnStatistic.getMaxValue();
             double distinctValue = Math.min(rowCount, columnStatistic.getDistinctValuesCount());
+            double nullsFraction = columnStatistic.getNullsFraction();
             final boolean minMaxValueInfinite = Double.isInfinite(minValue) || Double.isInfinite(maxValue);
             switch (callOperator.getFnName().toLowerCase()) {
                 // Begin CELONIS cases
@@ -604,6 +605,7 @@ public class ExpressionStatisticCalculator {
                 case FunctionSet.CELONIS_XX_HASH3_128_V4:
                     minValue = LargeIntLiteral.LARGE_INT_MIN.doubleValue();
                     maxValue = LargeIntLiteral.LARGE_INT_MAX.doubleValue();
+                    nullsFraction = 0.0;
                     break;
                 // End CELONIS cases
                 case FunctionSet.SIGN:
@@ -877,7 +879,7 @@ public class ExpressionStatisticCalculator {
             return ColumnStatistic.builder()
                     .setMinValue(minValue)
                     .setMaxValue(maxValue)
-                    .setNullsFraction(columnStatistic.getNullsFraction())
+                    .setNullsFraction(nullsFraction)
                     .setAverageRowSize(averageRowSize)
                     .setDistinctValuesCount(distinctValue)
                     .build();
