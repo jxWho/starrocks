@@ -5,6 +5,7 @@
 #include "exprs/celonis/base64.h"
 #include "exprs/celonis/util.h"
 #include "exprs/function_context.h"
+#include "util.h"
 #include "util/defer_op.h"
 
 #include <glog/logging.h>
@@ -15,11 +16,11 @@ using json = nlohmann::json;
 
 namespace starrocks {
 
-struct CelonisInJsonTestParam {
+struct CelonisInJsonArrayTestParam {
     bool compress_json_str = false;
 };
 
-class CelonisInJsonTest :public testing::TestWithParam<CelonisInJsonTestParam> {
+class CelonisInJsonArrayTest :public testing::TestWithParam<CelonisInJsonArrayTestParam> {
 protected:
     void SetUp() override {}
 
@@ -30,12 +31,12 @@ private:
     void Prepare() {
         std::vector<FunctionContext::TypeDesc> arg_types = {
                 AnyValUtil::column_type_to_type_desc(TypeDescriptor::from_logical_type(LT)),
-                AnyValUtil::column_type_to_type_desc(TypeDescriptor::from_logical_type(TYPE_VARCHAR))};
+                AnyValUtil::column_type_to_type_desc(TypeDescriptor::from_logical_type(TYPE_ARRAY))};
         auto return_type = AnyValUtil::column_type_to_type_desc(TypeDescriptor::from_logical_type(TYPE_BOOLEAN));
         ctx_.reset(FunctionContext::create_test_context(std::move(arg_types), return_type));
 
         value_column_ = ColumnHelper::create_column(TypeDescriptor(LT), true);
-        match_json_column_ = ColumnHelper::create_column(TypeDescriptor(TYPE_VARCHAR), false);
+        match_array_json_column_ = ColumnHelper::create_column(celonis::array_type(TYPE_VARCHAR), true);
     }
 
     template<LogicalType LT>
@@ -43,7 +44,9 @@ private:
         value_column_->append_datum(value);
         json match_array_json = ToJsonArray<LT>(match_array);
         std::string match_array_json_str = match_array_json.dump();
-        match_json_column_->append_datum(Slice(match_array_json_str));
+        DatumArray array;
+        array.emplace_back(Slice(match_array_json_str));
+        match_array_json_column_->append_datum(array);
     }
 
     template<LogicalType LT>
@@ -56,7 +59,7 @@ private:
             CelonisInJson<LT>::close(ctx_.get(), FunctionContext::THREAD_LOCAL);
         });
         RETURN_IF_ERROR(CelonisInJson<LT>::prepare(ctx_.get(), FunctionContext::THREAD_LOCAL));
-        auto result = CelonisInJson<LT>::in_json(ctx_.get(), {value_column_, match_json_column_});
+        auto result = CelonisInJson<LT>::in_json_array(ctx_.get(), {value_column_, match_array_json_column_});
         return result;
     }
 
@@ -93,11 +96,19 @@ private:
 
     template<LogicalType LT>
     StatusOr<ColumnPtr> RunConstantMatch(const std::string& json_str, bool compress_json_str) {
-        match_json_column_->append_datum(
-                Slice(compress_json_str ? compressAndBase64Encode(json_str) : json_str));
+        std::string str = compress_json_str ? compressAndBase64Encode(json_str) : json_str;
+        // Split the string into 2 parts
+        size_t mid = str.length() / 2;
+        std::string part1 = str.substr(0, mid);
+        std::string part2 = str.substr(mid);
+
+        DatumArray array;
+        array.emplace_back(Slice(part1));
+        array.emplace_back(Slice(part2));
+        match_array_json_column_->append_datum(array);
         const auto nrows = value_column_->size();
-        match_json_column_ = ConstColumn::create(match_json_column_, nrows);
-        ctx_->set_constant_columns({nullptr, match_json_column_});
+        match_array_json_column_ = ConstColumn::create(match_array_json_column_, nrows);
+        ctx_->set_constant_columns({nullptr, match_array_json_column_});
         return Run<LT>();
     }
 
@@ -113,10 +124,10 @@ private:
 
     std::unique_ptr<FunctionContext> ctx_;
     ColumnPtr value_column_;
-    ColumnPtr match_json_column_;
+    ColumnPtr match_array_json_column_;
 };
 
-TEST_P(CelonisInJsonTest, string_data_no_null_in_match_list) {
+TEST_P(CelonisInJsonArrayTest, string_data_no_null_in_match_list) {
     const LogicalType LT = TYPE_VARCHAR;
     Prepare<LT>();
 
@@ -135,7 +146,7 @@ TEST_P(CelonisInJsonTest, string_data_no_null_in_match_list) {
     EXPECT_EQ(true, result->get(3).get_uint8());
 }
 
-TEST_P(CelonisInJsonTest, string_data_null_in_match_list) {
+TEST_P(CelonisInJsonArrayTest, string_data_null_in_match_list) {
     const LogicalType LT = TYPE_VARCHAR;
     Prepare<LT>();
 
@@ -154,7 +165,7 @@ TEST_P(CelonisInJsonTest, string_data_null_in_match_list) {
     EXPECT_EQ(true, result->get(3).get_uint8());
 }
 
-TEST_P(CelonisInJsonTest, string_empty_match_list) {
+TEST_P(CelonisInJsonArrayTest, string_empty_match_list) {
     const LogicalType LT = TYPE_VARCHAR;
     Prepare<LT>();
 
@@ -173,7 +184,7 @@ TEST_P(CelonisInJsonTest, string_empty_match_list) {
     EXPECT_EQ(false, result->get(3).get_uint8());
 }
 
-TEST_P(CelonisInJsonTest, int_input) {
+TEST_P(CelonisInJsonArrayTest, int_input) {
     const LogicalType LT = TYPE_INT;
     Prepare<LT>();
 
@@ -192,7 +203,7 @@ TEST_P(CelonisInJsonTest, int_input) {
     EXPECT_EQ(false, result->get(3).get_uint8());
 }
 
-TEST_P(CelonisInJsonTest, bigint_input) {
+TEST_P(CelonisInJsonArrayTest, bigint_input) {
     const LogicalType LT = TYPE_BIGINT;
     Prepare<LT>();
 
@@ -213,7 +224,7 @@ TEST_P(CelonisInJsonTest, bigint_input) {
     EXPECT_EQ(false, result->get(4).get_uint8());
 }
 
-TEST_P(CelonisInJsonTest, double_input) {
+TEST_P(CelonisInJsonArrayTest, double_input) {
     const LogicalType LT = TYPE_DOUBLE;
     Prepare<LT>();
 
@@ -232,20 +243,20 @@ TEST_P(CelonisInJsonTest, double_input) {
     EXPECT_EQ(true, result->get(3).get_uint8());
 }
 
-TEST_P(CelonisInJsonTest, invalid_json_str) {
+TEST_P(CelonisInJsonArrayTest, invalid_json_str) {
     const LogicalType LT = TYPE_VARCHAR;
     Prepare<LT>();
     value_column_->append_datum("HELLO");
     const auto result = RunConstantMatch<LT>("UNKNOWN", GetParam().compress_json_str);
     EXPECT_TRUE(result.status().is_invalid_argument());
     if (GetParam().compress_json_str) {
-        EXPECT_EQ("[CELONIS_IN_JSON] Invalid JSON format: UNKNOWN", result.status().message());
+        EXPECT_EQ("[CELONIS_IN_JSON_ARRAY] Invalid JSON format: UNKNOWN", result.status().message());
     } else {
-        EXPECT_EQ("[CELONIS_IN_JSON] Failed to decompress JSON data", result.status().message());
+        EXPECT_EQ("[CELONIS_IN_JSON_ARRAY] Failed to decompress JSON data", result.status().message());
     }
 }
 
-TEST_F(CelonisInJsonTest, non_const_match_fail) {
+TEST_F(CelonisInJsonArrayTest, non_const_match_fail) {
     const LogicalType LT = TYPE_INT;
     Prepare<LT>();
 
@@ -254,11 +265,11 @@ TEST_F(CelonisInJsonTest, non_const_match_fail) {
 
     const auto result = Run<LT>();
     EXPECT_TRUE(result.status().is_invalid_argument());
-    EXPECT_EQ("The non-const version of [CELONIS_IN_JSON] should not be called.", result.status().message());
+    EXPECT_EQ("The non-const version of [CELONIS_IN_JSON_ARRAY] should not be called.", result.status().message());
 }
 
-INSTANTIATE_TEST_SUITE_P(CelonisInJsonTest, CelonisInJsonTest,
-                         ::testing::Values(CelonisInJsonTestParam{true}, CelonisInJsonTestParam{false}));
+INSTANTIATE_TEST_SUITE_P(CelonisInJsonArrayTest, CelonisInJsonArrayTest,
+                         ::testing::Values(CelonisInJsonArrayTestParam{true}, CelonisInJsonArrayTestParam{false}));
 
 
 } // namespace starrocks
