@@ -11,28 +11,15 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 package com.starrocks.sql.optimizer.rewrite.celonis;
 
-import com.starrocks.catalog.FunctionSet;
-import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
 
 import java.math.BigInteger;
 
-public interface CelonisHashFunction {
-    BigInteger compute(String input);
-    BigInteger computeNull();
-
-    static CelonisHashFunction of(CallOperator callOperator) {
-        switch (callOperator.getFnName().toLowerCase()) {
-            case FunctionSet.CELONIS_XX_HASH3_128_NULLABLE:
-                return new XXHASH3128NULLABLE();
-            case FunctionSet.CELONIS_XX_HASH3_128_V3:
-                return new XXHASH3128V3();
-            case FunctionSet.CELONIS_XX_HASH3_128_V4:
-                return new XXHASH3128V4();
-            default:
-                return null;
-        }
+// The behavior of this hash function coincides with XXHASH3128V3 up to handling of null values
+public class XXHASH3128NULLABLE extends XXHASH3128V3 {
+    @Override
+    public BigInteger computeNull() {
+        return null;
     }
 }
