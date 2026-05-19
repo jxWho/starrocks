@@ -352,6 +352,9 @@ struct TQueryOptions {
   191: optional i64 column_view_concat_bytes_limit;
 
   217: optional bool enable_cache_udaf = false;
+
+  // CELONIS
+  10001: optional i64 multi_array_agg_v2_debug_level;
 }
 
 // A scan range plus the parameters needed to execute that scan.
