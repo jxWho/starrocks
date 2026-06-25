@@ -1,10 +1,36 @@
-name: "Celonis Unit Test and SonarQube Daily"
+name: "celonis-pr-sonarqube"
 
 on:
-  schedule:
-    - cron: "30 5 * * *"
-  # To manually trigger the workflow. For debugging purpose.
   workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "fe/**/*.java"
+      - "be/**/celonis/**/*.c"
+      - "be/**/celonis/**/*.cc"
+      - "be/**/celonis/**/*.cpp"
+      - "be/**/celonis/**/*.cxx"
+      - "be/**/celonis/**/*.h"
+      - "be/**/celonis/**/*.hh"
+      - "be/**/celonis/**/*.hpp"
+      - "be/**/celonis/**/*.hxx"
+      - "be/**/*celonis*.c"
+      - "be/**/*celonis*.cc"
+      - "be/**/*celonis*.cpp"
+      - "be/**/*celonis*.cxx"
+      - "be/**/*celonis*.h"
+      - "be/**/*celonis*.hh"
+      - "be/**/*celonis*.hpp"
+      - "be/**/*celonis*.hxx"
+
+# This allows a subsequently queued workflow run to interrupt previous runs
+concurrency:
+  group: "${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.ref }}"
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
 
 env:
   RELEASE_VERSION: fe-test
@@ -21,67 +47,7 @@ jobs:
     steps:
       - run: echo "builder_image=${{ env.BUILDER }}" >> $GITHUB_OUTPUT
 
-  fe-amd-test:
-    runs-on: [runs-on, "runner=64cpu-linux-x64,volume=100g", "run-id=${{ github.run_id }}"]
-    needs: setup
-    container:
-      image: ${{ needs.setup.outputs.builder_image }}
-      credentials:
-        username: ${{ github.repository }}
-        password: ${{ secrets.CELOBOT_GITHUB_TOKEN }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: FE unit tests
-        uses: ./.github/actions/fe-unit-tests
-      - name: Upload FE AMD test diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fe-amd-test-diagnostics
-          path: |
-            fe/fe-core/target/surefire-reports/
-            fe/fe-core/*.dump
-            fe/fe-core/*-jvmRun*.dump
-            fe/fe-core/*.dumpstream
-            fe/fe-core/hs_err_pid*.log
-            hs_err_pid*.log
-          if-no-files-found: ignore
-          retention-days: 1
-
-  fe-arm-test:
-    runs-on: [runs-on, "runner=64cpu-linux-arm64,volume=100g", "run-id=${{ github.run_id }}"]
-    needs: setup
-    container:
-      image: ${{ needs.setup.outputs.builder_image }}
-      credentials:
-        username: ${{ github.repository }}
-        password: ${{ secrets.CELOBOT_GITHUB_TOKEN }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: FE unit tests
-        uses: ./.github/actions/fe-unit-tests
-      - name: Upload FE ARM test diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fe-arm-test-diagnostics
-          path: |
-            fe/fe-core/target/surefire-reports/
-            fe/fe-core/*.dump
-            fe/fe-core/*-jvmRun*.dump
-            fe/fe-core/*.dumpstream
-            fe/fe-core/hs_err_pid*.log
-            hs_err_pid*.log
-          if-no-files-found: ignore
-          retention-days: 1
-
-  fe-sonarQube-scan:
+  fe-coverage:
     runs-on: [runs-on, "runner=64cpu-linux-x64,volume=100g", "run-id=${{ github.run_id }}"]
     needs: setup
     container:
@@ -154,7 +120,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fe-sonar-artifacts
+          name: pr-fe-sonar-artifacts
           path: |
             fe/fe-core/target/site/jacoco/jacoco.xml
             fe/fe-core/target/classes/
@@ -162,10 +128,31 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      - name: SonarQube FE Scan
-        if: always() && hashFiles('fe/fe-core/target/site/jacoco/jacoco.xml') != ''
+      - name: SonarQube FE PR Scan
+        if: always() && github.event_name == 'pull_request' && hashFiles('fe/fe-core/target/site/jacoco/jacoco.xml') != ''
         uses: SonarSource/sonarqube-scan-action@v6
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.pullrequest.key=${{ github.event.pull_request.number }}
+            -Dsonar.pullrequest.branch=${{ github.head_ref }}
+            -Dsonar.pullrequest.base=${{ github.base_ref }}
+            -Dsonar.projectKey=celonis_celostar-starrocks-fe
+            -Dsonar.organization=celonis
+            -Dsonar.host.url=https://sonarcloud.io
+            -Dsonar.sources=fe/fe-core/src/main/java
+            -Dsonar.inclusions=fe/fe-core/src/main/java/**/celonis/**/*.java
+            -Dsonar.java.binaries=fe/fe-core/target/classes
+            -Dsonar.java.libraries=fe/fe-core/target/dependency/*.jar
+            -Dsonar.coverage.jacoco.xmlReportPaths=fe/fe-core/target/site/jacoco/jacoco.xml
+
+      - name: SonarQube FE Manual Branch Scan
+        if: always() && github.event_name == 'workflow_dispatch' && hashFiles('fe/fe-core/target/site/jacoco/jacoco.xml') != ''
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
           args: >
@@ -179,7 +166,7 @@ jobs:
             -Dsonar.java.libraries=fe/fe-core/target/dependency/*.jar
             -Dsonar.coverage.jacoco.xmlReportPaths=fe/fe-core/target/site/jacoco/jacoco.xml
 
-  be-sonarQube-scan:
+  be-coverage-and-sonarqube:
     name: be-sonarQube-scan
     runs-on: [runs-on, "runner=64cpu-linux-x64,volume=150g", "run-id=${{ github.run_id }}"]
     needs: setup
@@ -194,17 +181,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Shallow clones should be disabled for a better relevancy of analysis
+          fetch-depth: 0
+
       - name: Set up Python 3.8 for gcovr
         uses: actions/setup-python@v4
         with:
           python-version: 3.8
-      - name: install gcovr 5.0
+
+      - name: Install gcovr 5.0
         run: |
           apt-get update
           apt-get install -y libxml2-dev libxslt1-dev zlib1g-dev gcc python3-dev
 
           pip install gcovr==5.0 # 5.1 is not supported
+
       - name: Set up JDK 11
         uses: actions/setup-java@v4
         with:
@@ -218,10 +208,10 @@ jobs:
           free -h
           echo "--- Cgroup Memory Limit ---"
           cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || cat /sys/fs/cgroup/memory.max
+
       - name: Set up envs
         shell: bash
         run: |
-          # Define the home directory
           export STARROCKS_HOME=$(pwd)
           export CMAKE_BUILD_TYPE=Release
           export CMAKE_BUILD_DIR=${STARROCKS_HOME}/be/ut_build_${CMAKE_BUILD_TYPE}
@@ -235,10 +225,8 @@ jobs:
       - name: Configure and build BE tests
         shell: bash
         run: |
-          # Source environment scripts if they exist
           [ -f ./env.sh ] && . ./env.sh
 
-          # Create build and output directories
           cd ${STARROCKS_HOME}/be
           mkdir -p ${CMAKE_BUILD_DIR}
           cd ${CMAKE_BUILD_DIR}
@@ -259,7 +247,7 @@ jobs:
           cp compile_commands.json "${SONARQUBE_OUTPUT}/compile_commands.json"
           make -j"${BUILD_PARALLELISM:-16}" starrocks_test
 
-      - name: Run Tests
+      - name: Run BE Tests
         id: run-be-tests
         shell: bash
         run: |
@@ -279,10 +267,8 @@ jobs:
             java_version=$(jdk_version)
             if [[ $java_version -gt 8 ]]; then
               export LD_LIBRARY_PATH=$JAVA_HOME/lib/server:$JAVA_HOME/lib:$LD_LIBRARY_PATH
-              # JAVA_HOME is jdk
             elif [[ -d "$JAVA_HOME/jre"  ]]; then
               export LD_LIBRARY_PATH=$JAVA_HOME/jre/lib/$jvm_arch/server:$JAVA_HOME/jre/lib/$jvm_arch:$LD_LIBRARY_PATH
-            # JAVA_HOME is jre
             else
               export LD_LIBRARY_PATH=$JAVA_HOME/lib/$jvm_arch/server:$JAVA_HOME/lib/$jvm_arch:$LD_LIBRARY_PATH
             fi
@@ -299,7 +285,6 @@ jobs:
           fi
           export CLASSPATH="${STARROCKS_HOME}/conf:${HADOOP_CLASSPATH:-}:${STARROCKS_HOME}/java-extensions/udf-extensions/target/*:${STARROCKS_HOME}/java-extensions/java-utils/target/*:${CLASSPATH:-}"
 
-          # Execute tests to generate .gcda coverage data files
           cd ${STARROCKS_HOME}
           echo "GTest filter: ${gtest_filter}"
 
@@ -317,14 +302,10 @@ jobs:
             echo "Some tests failed, proceeding to collect remaining coverage..."
           fi
 
-      - name: Collect coverage into one XML report
+      - name: Collect BE coverage into one XML report
         if: always()
         run: |
           cd ${STARROCKS_HOME}
-          # -r . : Set the project root
-          # --object-directory : Point to where .gcda files are located
-          # --filter : Match the BE paths included in the SonarQube scan
-          # --sonarqube : Generate Sonar-compatible XML format
           gcda_count=$(find ${CMAKE_BUILD_DIR} -name '*.gcda' | wc -l | tr -d ' ')
           echo "Found ${gcda_count} .gcda files before gcovr."
           if [ "${gcda_count}" -eq 0 ]; then
@@ -335,6 +316,7 @@ jobs:
                 --object-directory ${CMAKE_BUILD_DIR} \
                 --filter 'be/src/.*' \
                 --sonarqube coverage.xml
+
       - name: Output BE Coverage Summary
         if: always()
         shell: bash
@@ -420,9 +402,30 @@ jobs:
           test -s sonarqube_output/compile_commands.json
           test -s coverage.xml
 
-      - name: SonarQube BE Scan
+      - name: SonarQube BE PR Scan
+        if: github.event_name == 'pull_request'
         uses: SonarSource/sonarqube-scan-action@v6
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.pullrequest.key=${{ github.event.pull_request.number }}
+            -Dsonar.pullrequest.branch=${{ github.head_ref }}
+            -Dsonar.pullrequest.base=${{ github.base_ref }}
+            -Dsonar.projectKey=celonis_celostar-starrocks-be
+            -Dsonar.organization=celonis
+            -Dsonar.host.url=https://sonarcloud.io
+            -Dsonar.sources=be/src
+            -Dsonar.cfamily.compile-commands=sonarqube_output/compile_commands.json
+            -Dsonar.coverageReportPaths=coverage.xml
+            -Dsonar.inclusions=be/src/**/celonis/**/*.cpp,be/src/**/celonis/**/*.cc,be/src/**/celonis/**/*.cxx,be/src/**/celonis/**/*.h,be/src/**/celonis/**/*.hpp
+
+      - name: SonarQube BE Manual Branch Scan
+        if: github.event_name == 'workflow_dispatch'
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
           args: >
@@ -439,7 +442,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: be-sonar-artifacts
+          name: pr-be-sonar-artifacts
           path: |
             sonarqube_output/
             coverage.xml
