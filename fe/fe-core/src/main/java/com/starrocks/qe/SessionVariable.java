@@ -947,7 +947,7 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     public static final String BACK_PRESSURE_THROTTLE_TIME_UPPER_BOUND = "back_pressure_throttle_time_upper_bound";
 
     public static final String ENABLE_CELONIS_HASH_MCVS = "enable_celonis_hash_mcvs";
-    
+
     public static final String LOWER_UPPER_SUPPORT_UTF8 = "lower_upper_support_utf8";
 
     public static final String COLUMN_VIEW_CONCAT_ROWS_LIMIT = "column_view_concat_rows_limit";
@@ -971,6 +971,8 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public static final String DYNAMIC_PARTITION_PRUNE_VALUES_LIMIT = "dynamic_partition_prune_limit";
     public static final String MCV_ROW_PERCENTAGE_PROPAGATION_THRESHOLD = "mcv_row_percentage_propagation_threshold";
+
+    public static final String ENABLE_UNNEST_VIRTUAL_STATISTICS = "enable_unnest_virtual_statistics";
 
     public static final List<String> DEPRECATED_VARIABLES = ImmutableList.<String>builder()
             .add(CODEGEN_LEVEL)
@@ -1930,7 +1932,7 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     private int backPressureMaxRounds = 3;
     @VarAttr(name = BACK_PRESSURE_THROTTLE_TIME_UPPER_BOUND)
     private long backPressureThrottleTimeUpperBound = 300;
-    
+
     @VarAttr(name = ENABLE_CELONIS_HASH_MCVS)
     private boolean enableCelonisHashMcvs = false;
 
@@ -1995,6 +1997,9 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     @VarAttr(name = ENABLE_LABELED_COLUMN_STATISTIC_OUTPUT)
     private boolean enableLabeledColumnStatisticOutput = false;
+
+    @VarAttr(name = ENABLE_UNNEST_VIRTUAL_STATISTICS)
+    private boolean enableUnnestVirtualStatistics = false;
 
     public int getCboPruneJsonSubfieldDepth() {
         return cboPruneJsonSubfieldDepth;
@@ -5373,7 +5378,7 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     public void setBackPressureThrottleTimeUpperBound(long value) {
         this.backPressureThrottleTimeUpperBound = value;
     }
-    
+
     public boolean getEnableCelonisHashMcvs() {
         return enableCelonisHashMcvs;
     }
@@ -5381,7 +5386,7 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     public void setEnableCelonisHashMcvs(boolean enableCelonisHashMcvs) {
         this.enableCelonisHashMcvs = enableCelonisHashMcvs;
     }
-    
+
 
     public long getColumnViewConcatRowsLimit() {
         return columnViewConcatRowsLimit;
@@ -5477,6 +5482,14 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public double getMcvRowPercentagePropagationThreshold() {
         return mcvRowPercentagePropagationThreshold;
+    }
+
+    public void setEnableUnnestVirtualStatistics(boolean flag) {
+        this.enableUnnestVirtualStatistics = flag;
+    }
+
+    public boolean isUnnestVirtualStatisticsEnabled() {
+        return this.enableUnnestVirtualStatistics;
     }
 
     // Serialize to thrift object
